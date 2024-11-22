@@ -11,6 +11,7 @@ from aiokafka.errors import CommitFailedError, IllegalStateError, KafkaError
 from aiokafka.structs import OffsetAndMetadata, TopicPartition
 from mode.utils import text
 from mode.utils.futures import done_future
+from mode.utils.times import humanize_seconds_ago
 from opentracing.ext import tags
 
 import faust
@@ -234,7 +235,7 @@ class TestConsumer:
         serialized_value_size=40,
         **kwargs,
     ):
-        return Mock(
+        return MagicMock(
             name="record",
             topic=topic,
             partition=partition,
@@ -281,8 +282,8 @@ class AIOKafkaConsumerThreadFixtures:
         return tracer
 
     @pytest.fixture()
-    def _consumer(self):
-        return Mock(
+    def _consumer(self, now, cthread, tp):
+        _consumer = Mock(
             name="AIOKafkaConsumer",
             autospec=aiokafka.AIOKafkaConsumer,
             start=AsyncMock(),
@@ -293,6 +294,17 @@ class AIOKafkaConsumerThreadFixtures:
             _client=Mock(name="Client", close=AsyncMock()),
             _coordinator=Mock(name="Coordinator", close=AsyncMock()),
         )
+        _consumer.assignment.return_value = {tp}
+
+        (
+            _consumer._fetcher._subscriptions.subscription.assignment.state_value
+        ).return_value = MagicMock(
+            assignment={tp},
+            timestamp=now * 1000.0,
+            highwater=1,
+            position=0,
+        )
+        return _consumer
 
     @pytest.fixture()
     def now(self):
@@ -465,7 +477,6 @@ class Test_VEP_no_response_since_start(Test_verify_event_path_base):
         )
 
 
-@pytest.mark.skip("Needs fixing")
 class Test_VEP_no_recent_fetch(Test_verify_event_path_base):
     def test_recent_fetch(self, *, cthread, now, tp, logger):
         self._set_last_response(now - 30.0)
@@ -473,10 +484,15 @@ class Test_VEP_no_recent_fetch(Test_verify_event_path_base):
         assert cthread.verify_event_path(now, tp) is None
         logger.error.assert_not_called()
 
-    def test_timed_out(self, *, cthread, now, tp, logger):
+    def test_timed_out(self, *, cthread, now, tp, logger, _consumer):
         self._set_last_response(now - 30.0)
         self._set_last_request(now - cthread.tp_fetch_request_timeout_secs * 2)
-        assert cthread.verify_event_path(now, tp) is None
+        assert (
+            cthread.verify_event_path(
+                now + cthread.tp_fetch_request_timeout_secs * 2, tp
+            )
+            is None
+        )
         logger.error.assert_called_with(
             mod.SLOW_PROCESSING_NO_RECENT_FETCH,
             ANY,
@@ -503,11 +519,10 @@ class Test_VEP_no_recent_response(Test_verify_event_path_base):
         )
 
 
-@pytest.mark.skip("Needs fixing")
 class Test_VEP_no_highwater_since_start(Test_verify_event_path_base):
     highwater = None
 
-    def test_no_monitor(self, *, app, cthread, now, tp, logger):
+    def test_no_monitor(self, *, app, cthread, now, tp, logger, _consumer):
         self._set_last_request(now - 10.0)
         self._set_last_response(now - 5.0)
         self._set_started(now)
@@ -515,17 +530,35 @@ class Test_VEP_no_highwater_since_start(Test_verify_event_path_base):
         assert cthread.verify_event_path(now, tp) is None
         logger.error.assert_not_called()
 
-    def test_just_started(self, *, cthread, now, tp, logger):
+    def test_just_started(self, *, cthread, now, tp, logger, _consumer):
         self._set_last_request(now - 10.0)
         self._set_last_response(now - 5.0)
         self._set_started(now)
         assert cthread.verify_event_path(now, tp) is None
         logger.error.assert_not_called()
 
-    def test_timed_out(self, *, cthread, now, tp, logger):
+    def test_timed_out(self, *, cthread, now, tp, logger, _consumer):
         self._set_last_request(now - 10.0)
         self._set_last_response(now - 5.0)
         self._set_started(now - cthread.tp_stream_timeout_secs * 2)
+        _consumer.assignment.return_value = {tp}
+        assignment = cthread.assignment()
+
+        assert assignment == {tp}
+        fetcher = _consumer._fetcher
+        (fetcher._subscriptions.subscription.assignment.state_value).return_value = (
+            MagicMock(
+                assignment=assignment,
+                timestamp=now * 1000.0,
+                highwater=None,
+                tp_stream_timeout_secs=cthread.tp_stream_timeout_secs,
+                tp_fetch_request_timeout_secs=cthread.tp_fetch_request_timeout_secs,
+            )
+        )
+        (
+            fetcher._subscriptions.subscription.assignment.state_value.timestamp
+        ).return_value = now
+
         assert cthread.verify_event_path(now, tp) is None
         logger.error.assert_called_with(
             mod.SLOW_PROCESSING_NO_HIGHWATER_SINCE_START,
@@ -534,7 +567,6 @@ class Test_VEP_no_highwater_since_start(Test_verify_event_path_base):
         )
 
 
-@pytest.mark.skip("Needs fixing")
 class Test_VEP_stream_idle_no_highwater(Test_verify_event_path_base):
     highwater = 10
     committed_offset = 10
@@ -547,7 +579,6 @@ class Test_VEP_stream_idle_no_highwater(Test_verify_event_path_base):
         logger.error.assert_not_called()
 
 
-@pytest.mark.skip("Needs fixing")
 class Test_VEP_stream_idle_highwater_no_acks(Test_verify_event_path_base):
     acks_enabled = False
 
@@ -559,7 +590,6 @@ class Test_VEP_stream_idle_highwater_no_acks(Test_verify_event_path_base):
         logger.error.assert_not_called()
 
 
-@pytest.mark.skip("Needs fixing")
 class Test_VEP_stream_idle_highwater_same_has_acks_everything_OK(
     Test_verify_event_path_base
 ):
@@ -572,6 +602,7 @@ class Test_VEP_stream_idle_highwater_same_has_acks_everything_OK(
         self._set_last_request(now - 10.0)
         self._set_last_response(now - 5.0)
         self._set_started(now)
+
         assert cthread.verify_event_path(now, tp) is None
         logger.error.assert_not_called()
 
@@ -636,7 +667,6 @@ class Test_VEP_stream_idle_highwater_no_inbound(Test_verify_event_path_base):
         )
 
 
-@pytest.mark.skip("Needs fixing")
 class Test_VEP_no_commit(Test_verify_event_path_base):
     highwater = 20
     committed_offset = 10
@@ -664,13 +694,13 @@ class Test_VEP_no_commit(Test_verify_event_path_base):
         expected_message = cthread._make_slow_processing_error(
             mod.SLOW_PROCESSING_NO_COMMIT_SINCE_START,
             [mod.SLOW_PROCESSING_CAUSE_COMMIT],
+            setting="broker_commit_livelock_soft_timeout",
+            current_value=app.conf.broker_commit_livelock_soft_timeout,
         )
         logger.error.assert_called_once_with(
             expected_message,
             tp,
-            ANY,
-            setting="broker_commit_livelock_soft_timeout",
-            current_value=app.conf.broker_commit_livelock_soft_timeout,
+            humanize_seconds_ago(cthread.tp_commit_timeout_secs * 2),
         )
 
     def test_timed_out_since_last(self, *, app, cthread, now, tp, logger):
@@ -681,13 +711,13 @@ class Test_VEP_no_commit(Test_verify_event_path_base):
         expected_message = cthread._make_slow_processing_error(
             mod.SLOW_PROCESSING_NO_RECENT_COMMIT,
             [mod.SLOW_PROCESSING_CAUSE_COMMIT],
+            setting="broker_commit_livelock_soft_timeout",
+            current_value=app.conf.broker_commit_livelock_soft_timeout,
         )
         logger.error.assert_called_once_with(
             expected_message,
             tp,
-            ANY,
-            setting="broker_commit_livelock_soft_timeout",
-            current_value=app.conf.broker_commit_livelock_soft_timeout,
+            humanize_seconds_ago(now - cthread.tp_commit_timeout_secs * 4),
         )
 
     def test_committing_fine(self, *, app, cthread, now, tp, logger):
@@ -787,7 +817,7 @@ class Test_AIOKafkaConsumerThread(AIOKafkaConsumerThreadFixtures):
                 api_version=app.conf.consumer_api_version,
                 client_id=conf.broker_client_id,
                 group_id=conf.id,
-                # group_instance_id=conf.consumer_group_instance_id,
+                group_instance_id=conf.consumer_group_instance_id,
                 bootstrap_servers=server_list(transport.url, transport.default_port),
                 partition_assignment_strategy=[cthread._assignor],
                 enable_auto_commit=False,
@@ -1288,8 +1318,7 @@ class Test_AIOKafkaConsumerThread(AIOKafkaConsumerThreadFixtures):
             cthread.call_thread.assert_called_once_with(method, *args, **kwargs)
 
 
-class MyPartitioner:
-    ...
+class MyPartitioner: ...
 
 
 my_partitioner = MyPartitioner()
@@ -1345,6 +1374,8 @@ class ProducerBaseTest:
         max_batch_size=16384,
         max_request_size=1000000,
         request_timeout_ms=1200000,
+        metadata_max_age_ms=300000,
+        connections_max_idle_ms=540000,
         security_protocol="PLAINTEXT",
         **kwargs,
     ):
@@ -1352,19 +1383,20 @@ class ProducerBaseTest:
             p = producer._new_producer()
             assert p is AIOKafkaProducer.return_value
             AIOKafkaProducer.assert_called_once_with(
-                acks=acks,
-                api_version=api_version,
                 bootstrap_servers=bootstrap_servers,
                 client_id=client_id,
-                compression_type=compression_type,
+                acks=acks,
                 linger_ms=linger_ms,
                 max_batch_size=max_batch_size,
                 max_request_size=max_request_size,
-                request_timeout_ms=request_timeout_ms,
+                compression_type=compression_type,
                 security_protocol=security_protocol,
-                loop=producer.loop,
                 partitioner=producer.partitioner,
                 transactional_id=None,
+                api_version=api_version,
+                metadata_max_age_ms=metadata_max_age_ms,
+                connections_max_idle_ms=connections_max_idle_ms,
+                request_timeout_ms=request_timeout_ms,
                 **kwargs,
             )
 
@@ -1434,7 +1466,6 @@ class TestProducer(ProducerBaseTest):
         app.in_transaction = False
         assert producer._settings_extra() == {}
 
-    @pytest.mark.skip("fix me")
     def test__new_producer(self, *, app):
         producer = Producer(app.transport)
         self.assert_new_producer(producer)
@@ -1443,8 +1474,8 @@ class TestProducer(ProducerBaseTest):
         "expected_args",
         [
             pytest.param(
-                {"api_version": "0.10"},
-                marks=pytest.mark.conf(producer_api_version="0.10"),
+                {"api_version": "auto"},
+                marks=pytest.mark.conf(producer_api_version="auto"),
             ),
             pytest.param({"acks": -1}, marks=pytest.mark.conf(producer_acks="all")),
             pytest.param(
@@ -1476,6 +1507,14 @@ class TestProducer(ProducerBaseTest):
                 marks=pytest.mark.conf(producer_request_timeout=1234134),
             ),
             pytest.param(
+                {"metadata_max_age_ms": 300000},
+                marks=pytest.mark.conf(metadata_max_age_ms=300000),
+            ),
+            pytest.param(
+                {"connections_max_idle_ms": 540000},
+                marks=pytest.mark.conf(connections_max_idle_ms=540000),
+            ),
+            pytest.param(
                 {
                     "security_protocol": "SASL_PLAINTEXT",
                     "sasl_mechanism": "PLAIN",
@@ -1491,7 +1530,6 @@ class TestProducer(ProducerBaseTest):
             ),
         ],
     )
-    @pytest.mark.skip("fix me")
     def test__new_producer__using_settings(self, expected_args, *, app):
         producer = Producer(app.transport)
         self.assert_new_producer(producer, **expected_args)
@@ -1803,7 +1841,6 @@ class TestThreadedProducer(ProducerBaseTest):
             await threaded_producer.start()
             await threaded_producer.stop()
 
-    @pytest.mark.skip("Needs fixing")
     @pytest.mark.asyncio
     async def test_on_thread_stop(
         self,
